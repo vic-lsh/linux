@@ -218,12 +218,22 @@ static inline bool vma_can_userfault(struct vm_area_struct *vma,
 {
 	vm_flags &= __VM_UFFD_FLAGS;
 
-	if (vm_flags & VM_DROPPABLE)
+	bool is_anon = vma_is_anonymous(vma);
+	bool is_dax = vma_is_dax(vma);
+	bool is_hugetlb = is_vm_hugetlb_page(vma);
+	bool is_shmem = vma_is_shmem(vma);
+
+	if (vm_flags & VM_DROPPABLE) {
+		printk(KERN_ERR "vma_can_userfault: reject b/c droppable %d %d %d\n", is_anon, is_hugetlb, is_shmem);
 		return false;
+	}
 
 	if ((vm_flags & VM_UFFD_MINOR) &&
-	    (!is_vm_hugetlb_page(vma) && !vma_is_shmem(vma)))
+	    (!is_vm_hugetlb_page(vma) && !vma_is_shmem(vma))) {
+		printk(KERN_ERR "vma_can_userfault: minor %d %d %d\n", is_anon, is_hugetlb, is_shmem);
 		return false;
+	}
+
 
 	/*
 	 * If wp async enabled, and WP is the only mode enabled, allow any
@@ -238,13 +248,16 @@ static inline bool vma_can_userfault(struct vm_area_struct *vma,
 	 * uffd-wp, then shmem & hugetlbfs are not supported but only
 	 * anonymous.
 	 */
-	if ((vm_flags & VM_UFFD_WP) && !vma_is_anonymous(vma))
+	if ((vm_flags & VM_UFFD_WP) && !vma_is_anonymous(vma)) {
+		printk(KERN_ERR "vma_can_userfault: not-anon %d %d %d\n", is_anon, is_hugetlb, is_shmem);
 		return false;
+	}
 #endif
 
+	printk(KERN_ERR "vma_can_userfault: %d %d %d %d\n", is_anon, is_dax, is_hugetlb, is_shmem);
 	/* By default, allow any of anon|shmem|hugetlb */
-	return vma_is_anonymous(vma) || is_vm_hugetlb_page(vma) ||
-	    vma_is_shmem(vma);
+	return vma_is_anonymous(vma) || vma_is_dax(vma) || 
+		is_vm_hugetlb_page(vma) || vma_is_shmem(vma);
 }
 
 extern int dup_userfaultfd(struct vm_area_struct *, struct list_head *);

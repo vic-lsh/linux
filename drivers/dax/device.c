@@ -18,7 +18,7 @@ static int check_vma(struct dev_dax *dev_dax, struct vm_area_struct *vma,
 		const char *func)
 {
 	struct device *dev = &dev_dax->dev;
-	unsigned long mask;
+	unsigned long mask, mask2;
 
 	if (!dax_alive(dev_dax->dax_dev))
 		return -ENXIO;
@@ -32,7 +32,9 @@ static int check_vma(struct dev_dax *dev_dax, struct vm_area_struct *vma,
 	}
 
 	mask = dev_dax->align - 1;
-	if (vma->vm_start & mask || vma->vm_end & mask) {
+	mask2 = (unsigned int)4096 - 1;
+	if ((vma->vm_start & mask || vma->vm_end & mask) &&
+	    (vma->vm_start & mask || vma->vm_end & mask)) {
 		dev_info_ratelimited(dev,
 				"%s: %s: fail, unaligned vma (%#lx - %#lx, %#lx)\n",
 				current->comm, func, vma->vm_start, vma->vm_end,
@@ -117,8 +119,10 @@ static vm_fault_t __dev_dax_pte_fault(struct dev_dax *dev_dax,
 		return VM_FAULT_SIGBUS;
 	}
 
-	if (fault_size != dev_dax->align)
-		return VM_FAULT_SIGBUS;
+	// if (fault_size != dev_dax->align)
+	// 	return VM_FAULT_SIGBUS;
+
+	// [NOTE] missing userfaultfd_missing(vma) check
 
 	phys = dax_pgoff_to_phys(dev_dax, vmf->pgoff, PAGE_SIZE);
 	if (phys == -1) {
@@ -160,7 +164,7 @@ static vm_fault_t __dev_dax_pmd_fault(struct dev_dax *dev_dax,
 	/* if we are outside of the VMA */
 	if (pmd_addr < vmf->vma->vm_start ||
 			(pmd_addr + PMD_SIZE) > vmf->vma->vm_end)
-		return VM_FAULT_SIGBUS;
+		return VM_FAULT_FALLBACK;
 
 	pgoff = linear_page_index(vmf->vma, pmd_addr);
 	phys = dax_pgoff_to_phys(dev_dax, pgoff, PMD_SIZE);
@@ -264,7 +268,8 @@ static int dev_dax_may_split(struct vm_area_struct *vma, unsigned long addr)
 	struct file *filp = vma->vm_file;
 	struct dev_dax *dev_dax = filp->private_data;
 
-	if (!IS_ALIGNED(addr, dev_dax->align))
+	if (!IS_ALIGNED(addr, dev_dax->align) ||
+	    !IS_ALIGNED(addr, (unsigned int)4096))
 		return -EINVAL;
 	return 0;
 }

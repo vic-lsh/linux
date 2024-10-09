@@ -514,6 +514,9 @@ vm_fault_t handle_userfault(struct vm_fault *vmf, unsigned long reason)
 	set_current_state(blocking_state);
 	spin_unlock_irq(&ctx->fault_pending_wqh.lock);
 
+	if (vma_is_dax(vmf->vma)) {
+		must_wait = userfaultfd_huge_must_wait(ctx, vmf, reason);
+	}
 	if (!is_vm_hugetlb_page(vma))
 		must_wait = userfaultfd_must_wait(ctx, vmf, reason);
 	else
@@ -1312,21 +1315,27 @@ static int userfaultfd_register(struct userfaultfd_ctx *ctx,
 		goto out;
 
 	ret = -EINVAL;
-	if (!uffdio_register.mode)
+	if (!uffdio_register.mode) {
+		printk(KERN_ERR "uffdio_register no mode %d\n", ret);
 		goto out;
-	if (uffdio_register.mode & ~UFFD_API_REGISTER_MODES)
+	}
+	if (uffdio_register.mode & ~UFFD_API_REGISTER_MODES) {
+		printk(KERN_ERR "uffdio_register bad mode %d\n", ret);
 		goto out;
+	}
 	vm_flags = 0;
 	if (uffdio_register.mode & UFFDIO_REGISTER_MODE_MISSING)
 		vm_flags |= VM_UFFD_MISSING;
 	if (uffdio_register.mode & UFFDIO_REGISTER_MODE_WP) {
 #ifndef CONFIG_HAVE_ARCH_USERFAULTFD_WP
+		printk(KERN_ERR "uffdio_register no wp %d\n", ret);
 		goto out;
 #endif
 		vm_flags |= VM_UFFD_WP;
 	}
 	if (uffdio_register.mode & UFFDIO_REGISTER_MODE_MINOR) {
 #ifndef CONFIG_HAVE_ARCH_USERFAULTFD_MINOR
+		printk(KERN_ERR "uffdio_register no minor %d\n", ret);
 		goto out;
 #endif
 		vm_flags |= VM_UFFD_MINOR;
@@ -1334,8 +1343,10 @@ static int userfaultfd_register(struct userfaultfd_ctx *ctx,
 
 	ret = validate_range(mm, uffdio_register.range.start,
 			     uffdio_register.range.len);
-	if (ret)
+	if (ret) {
+		printk(KERN_ERR "uffdio_register invalid range %d\n", ret);
 		goto out;
+	}
 
 	start = uffdio_register.range.start;
 	end = start + uffdio_register.range.len;
@@ -1348,8 +1359,10 @@ static int userfaultfd_register(struct userfaultfd_ctx *ctx,
 	mmap_write_lock(mm);
 	vma_iter_init(&vmi, mm, start);
 	vma = vma_find(&vmi, end);
-	if (!vma)
+	if (!vma) {
+		printk(KERN_ERR "uffdio_register can't find vma %d\n", ret);
 		goto out_unlock;
+	}
 
 	/*
 	 * If the first vma contains huge pages, make sure start address
@@ -1358,8 +1371,10 @@ static int userfaultfd_register(struct userfaultfd_ctx *ctx,
 	if (is_vm_hugetlb_page(vma)) {
 		unsigned long vma_hpagesize = vma_kernel_pagesize(vma);
 
-		if (start & (vma_hpagesize - 1))
+		if (start & (vma_hpagesize - 1)) {
+			printk(KERN_ERR "uffdio_register address not hp aligned %d %lu %lu\n", ret, start, vma_hpagesize);
 			goto out_unlock;
+		}
 	}
 
 	/*
@@ -1376,8 +1391,10 @@ static int userfaultfd_register(struct userfaultfd_ctx *ctx,
 
 		/* check not compatible vmas */
 		ret = -EINVAL;
-		if (!vma_can_userfault(cur, vm_flags, wp_async))
+		if (!vma_can_userfault(cur, vm_flags, wp_async)) {
+			printk(KERN_ERR "uffdio_register can't userfault %d flags %lu async %d\n", ret, vm_flags, wp_async);
 			goto out_unlock;
+		}
 
 		/*
 		 * UFFDIO_COPY will fill file holes even without
@@ -1388,8 +1405,10 @@ static int userfaultfd_register(struct userfaultfd_ctx *ctx,
 		 * F_WRITE_SEAL can be taken until the vma is destroyed.
 		 */
 		ret = -EPERM;
-		if (unlikely(!(cur->vm_flags & VM_MAYWRITE)))
+		if (unlikely(!(cur->vm_flags & VM_MAYWRITE))) {
+			printk(KERN_ERR "uffdio_register can't write %d\n", ret);
 			goto out_unlock;
+		}
 
 		/*
 		 * If this vma contains ending address, and huge pages
@@ -1401,11 +1420,15 @@ static int userfaultfd_register(struct userfaultfd_ctx *ctx,
 
 			ret = -EINVAL;
 
-			if (end & (vma_hpagesize - 1))
+			if (end & (vma_hpagesize - 1)) {
+				printk(KERN_ERR "uffdio_register end addr not aligned %d %lu %lu\n", ret, end, vma_hpagesize);
 				goto out_unlock;
+			}
 		}
-		if ((vm_flags & VM_UFFD_WP) && !(cur->vm_flags & VM_MAYWRITE))
+		if ((vm_flags & VM_UFFD_WP) && !(cur->vm_flags & VM_MAYWRITE)) {
+			printk(KERN_ERR "uffdio_register wp but not writeable %d\n", ret);
 			goto out_unlock;
+		}
 
 		/*
 		 * Check that this vma isn't already owned by a
@@ -1415,8 +1438,10 @@ static int userfaultfd_register(struct userfaultfd_ctx *ctx,
 		 */
 		ret = -EBUSY;
 		if (cur->vm_userfaultfd_ctx.ctx &&
-		    cur->vm_userfaultfd_ctx.ctx != ctx)
+		    cur->vm_userfaultfd_ctx.ctx != ctx) {
+			printk(KERN_ERR "uffdio_register ctx already used %d\n", ret);
 			goto out_unlock;
+		}
 
 		/*
 		 * Note vmas containing huge pages
@@ -1454,6 +1479,7 @@ static int userfaultfd_register(struct userfaultfd_ctx *ctx,
 			start = vma->vm_start;
 		vma_end = min(end, vma->vm_end);
 
+		// [NOTE] did not update the flags here
 		new_flags = (vma->vm_flags & ~__VM_UFFD_FLAGS) | vm_flags;
 		vma = vma_modify_flags_uffd(&vmi, prev, vma, start, vma_end,
 					    new_flags,
