@@ -110,7 +110,7 @@ static vm_fault_t __dev_dax_pte_fault(struct dev_dax *dev_dax,
 	unsigned int fault_size = PAGE_SIZE;
 
 	if (check_vma(dev_dax, vmf->vma, __func__)) {
-		printk(KERN_ERR "pte_fault: check_vma failed\n");
+		// printk(KERN_ERR "pte_fault: check_vma failed\n");
 		return VM_FAULT_SIGBUS;
 	}
 
@@ -128,14 +128,30 @@ static vm_fault_t __dev_dax_pte_fault(struct dev_dax *dev_dax,
 	}
 	*/
 
-	if (vmf->vma && userfaultfd_missing(vmf->vma)) {
-		printk(KERN_ERR "pte_fault handling userfault\n");
-		return handle_userfault(vmf, VM_UFFD_MISSING);
+	if (vmf->vma) {
+		if ((vmf->flags & FAULT_FLAG_WRITE) && userfaultfd_wp(vmf->vma)) {
+			bool wp_fault = false;
+
+			if (vmf->flags & FAULT_FLAG_ORIG_PTE_VALID) {
+				pte_t orig = vmf->orig_pte;
+
+				wp_fault = pte_uffd_wp(orig) || pte_marker_uffd_wp(orig);
+			}
+			if (wp_fault) {
+				// printk(KERN_ERR "pte_fault handling userfault wp fault\n");
+				return handle_userfault(vmf, VM_UFFD_WP);
+			}
+		}
+		if (userfaultfd_missing(vmf->vma)) {
+			// printk(KERN_ERR "pte_fault handling userfault miss fault\n");
+			return handle_userfault(vmf, VM_UFFD_MISSING);
+		}
 	}
+
 
 	phys = dax_pgoff_to_phys(dev_dax, vmf->pgoff, PAGE_SIZE);
 	if (phys == -1) {
-		printk(KERN_ERR "phys not found\n");
+		// printk(KERN_ERR "phys not found\n");
 		dev_dbg(dev, "pgoff_to_phys(%#lx) failed\n", vmf->pgoff);
 		return VM_FAULT_SIGBUS;
 	}
@@ -158,37 +174,44 @@ static vm_fault_t __dev_dax_pmd_fault(struct dev_dax *dev_dax,
 	unsigned int fault_size = PMD_SIZE;
 
 	if (check_vma(dev_dax, vmf->vma, __func__)) {
-		printk(KERN_ERR "ptd_fault: check_vma failed\n");
+		// printk(KERN_ERR "ptd_fault: check_vma failed\n");
 		return VM_FAULT_SIGBUS;
 	}
 
 	if (dev_dax->align > PMD_SIZE) {
-		printk(KERN_ERR "ptd_fault: align > pmd_size\n");
+		// printk(KERN_ERR "ptd_fault: align > pmd_size\n");
 		dev_dbg(dev, "alignment (%#x) > fault size (%#x)\n",
 			dev_dax->align, fault_size);
 		return VM_FAULT_SIGBUS;
 	}
 
 	if (fault_size < dev_dax->align) {
-		printk(KERN_ERR "ptd_fault: size < align\n");
+		// printk(KERN_ERR "ptd_fault: size < align\n");
 		return VM_FAULT_SIGBUS;
 	}
 	else if (fault_size > dev_dax->align) {
-		printk(KERN_ERR "ptd_fault: align > size\n");
+		// printk(KERN_ERR "ptd_fault: align > size\n");
 		return VM_FAULT_FALLBACK;
 	}
 
 	/* if we are outside of the VMA */
 	if (pmd_addr < vmf->vma->vm_start ||
 			(pmd_addr + PMD_SIZE) > vmf->vma->vm_end) {
-		printk(KERN_ERR "ptd_fault: outside of vma\n");
+		// printk(KERN_ERR "ptd_fault: outside of vma\n");
 		return VM_FAULT_SIGBUS;
 	}
 
-	// if (vmf && userfaultfd_missing(vmf->vma)) {
-	// 	printk(KERN_ERR "pmd_fault handling userfault\n");
-	// 	return handle_userfault(vmf, VM_UFFD_MISSING);
-	// }
+	if (vmf->vma) {
+		if ((vmf->flags & FAULT_FLAG_WRITE) &&
+		    userfaultfd_huge_pmd_wp(vmf->vma, vmf->orig_pmd)) {
+			// printk(KERN_ERR "pmd_fault handling userfault wp fault\n");
+			return handle_userfault(vmf, VM_UFFD_WP);
+		}
+		if (userfaultfd_missing(vmf->vma)) {
+			// printk(KERN_ERR "pmd_fault handling userfault miss fault\n");
+			return handle_userfault(vmf, VM_UFFD_MISSING);
+		}
+	}
 
 	pgoff = linear_page_index(vmf->vma, pmd_addr);
 	phys = dax_pgoff_to_phys(dev_dax, pgoff, PMD_SIZE);
@@ -244,10 +267,15 @@ static vm_fault_t __dev_dax_pud_fault(struct dev_dax *dev_dax,
 		return VM_FAULT_SIGBUS;
 	}
 
-	// if (vmf && userfaultfd_missing(vmf->vma)) {
-	// 	printk(KERN_ERR "pud_fault handling userfault\n");
-	// 	return handle_userfault(vmf, VM_UFFD_MISSING);
-	// }
+	if (vmf->vma) {
+		if ((vmf->flags & FAULT_FLAG_WRITE) &&
+		    userfaultfd_wp(vmf->vma))
+			return VM_FAULT_FALLBACK;
+		if (userfaultfd_missing(vmf->vma)) {
+			// printk(KERN_ERR "pud_fault handling userfault miss fault\n");
+			return handle_userfault(vmf, VM_UFFD_MISSING);
+		}
+	}
 
 
 	pgoff = linear_page_index(vmf->vma, pud_addr);
