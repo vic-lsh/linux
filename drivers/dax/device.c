@@ -129,23 +129,96 @@ static vm_fault_t __dev_dax_pte_fault(struct dev_dax *dev_dax,
 	*/
 
 	if (vmf->vma) {
+		pte_t pte;
+		bool pte_valid = false;
+		bool pte_present = false;
+
+		/* Check the PTE state to determine fault type */
+		/* Prefer reading from vmf->pte if available, as vmf->orig_pte
+		 * might be stale after handle_userfault() returns (e.g., after
+		 * UFFDIO_WRITEPROTECT modifies the PTE).
+		 */
+		if (vmf->pte) {
+			printk(KERN_ERR "pte_fault handling userfault wp fault vmf->pte\n");
+			/* If PTE is available, read it (should be locked by caller) */
+			pte = ptep_get(vmf->pte);
+			pte_valid = true;
+			pte_present = !pte_none(pte);
+		} else if (vmf->flags & FAULT_FLAG_ORIG_PTE_VALID) {
+			printk(KERN_ERR "pte_fault handling userfault wp fault vmf->orig_pte\n");
+			pte = vmf->orig_pte;
+			pte_valid = true;
+			pte_present = !pte_none(pte);
+		}
+
+		bool wp_fault_flag = vmf->flags & FAULT_FLAG_WRITE;
+		bool wp_fault_vma = userfaultfd_wp(vmf->vma);
+		printk(KERN_ERR "wp_fault_flag: %d, wp_fault_vma: %d pte_valid: %d, pte_present: %d\n",
+			wp_fault_flag, wp_fault_vma, pte_valid, pte_present);
+
+		/*
+		 * Check for write-protection fault first.
+		 * This happens when:
+		 * - It's a write fault
+		 * - WP is enabled on the VMA
+		 * - The PTE is present and has uffd-wp bit set
+		 *
+		 * Note: We need to read the current PTE to check for WP bit.
+		 * If we can't read the PTE (pte_valid is false), we can't determine
+		 * if WP is set, so we proceed with normal fault handling. The kernel's
+		 * page fault handler will handle WP detection when it maps the PTE.
+		 */
 		if ((vmf->flags & FAULT_FLAG_WRITE) && userfaultfd_wp(vmf->vma)) {
 			bool wp_fault = false;
 
-			if (vmf->flags & FAULT_FLAG_ORIG_PTE_VALID) {
-				pte_t orig = vmf->orig_pte;
-
-				wp_fault = pte_uffd_wp(orig) || pte_marker_uffd_wp(orig);
+			if (pte_valid && pte_present) {
+				wp_fault = pte_uffd_wp(pte) || pte_marker_uffd_wp(pte);
+				printk(KERN_ERR "pte_fault WP check: pte_valid=%d pte_present=%d wp_fault=%d\n",
+					pte_valid, pte_present, wp_fault);
+			} else {
+				printk(KERN_ERR "pte_fault WP check skipped: pte_valid=%d pte_present=%d (can't read PTE)\n",
+					pte_valid, pte_present);
 			}
+
 			if (wp_fault) {
-				// printk(KERN_ERR "pte_fault handling userfault wp fault\n");
+				printk(KERN_ERR "pte_fault handling userfault wp fault\n");
 				return handle_userfault(vmf, VM_UFFD_WP);
 			}
 		}
+
+		/*
+		 * Check for missing fault.
+		 * This happens when:
+		 * - Missing fault handling is enabled on the VMA
+		 * - The PTE is not present (pte_none)
+		 *
+		 * Note: We can trust the PTE state if:
+		 * 1. We can read from vmf->pte (current state), OR
+		 * 2. We have cached vmf->orig_pte AND this is NOT a retry
+		 *    (FAULT_FLAG_TRIED not set), meaning the cache is fresh.
+		 *
+		 * On retry after WP handling, vmf->orig_pte might be stale
+		 * (from before UFFDIO_WRITEPROTECT modified the PTE), so we
+		 * only trust it if we can also read the current PTE.
+		 */
 		if (userfaultfd_missing(vmf->vma)) {
-			// printk(KERN_ERR "pte_fault handling userfault miss fault\n");
-			return handle_userfault(vmf, VM_UFFD_MISSING);
+			/* Trust PTE state if:
+			 * - We can read current PTE (vmf->pte != NULL), OR
+			 * - We have cached orig_pte AND it's NOT a retry (cache is fresh)
+			 */
+			bool can_trust_pte_state = (vmf->pte != NULL) ||
+				((vmf->flags & FAULT_FLAG_ORIG_PTE_VALID) &&
+				 !(vmf->flags & FAULT_FLAG_TRIED));
+
+			printk(KERN_ERR "pte_valid: %d, pte_present: %d, can_trust_pte_state: %d\n",
+				pte_valid, pte_present, can_trust_pte_state);
+
+			if (pte_valid && !pte_present && can_trust_pte_state) {
+				printk(KERN_ERR "pte_fault handling userfault miss fault\n");
+				return handle_userfault(vmf, VM_UFFD_MISSING);
+			}
 		}
+
 	}
 
 
@@ -202,15 +275,76 @@ static vm_fault_t __dev_dax_pmd_fault(struct dev_dax *dev_dax,
 	}
 
 	if (vmf->vma) {
-		if ((vmf->flags & FAULT_FLAG_WRITE) &&
-		    userfaultfd_huge_pmd_wp(vmf->vma, vmf->orig_pmd)) {
-			// printk(KERN_ERR "pmd_fault handling userfault wp fault\n");
-			return handle_userfault(vmf, VM_UFFD_WP);
+		pmd_t pmd;
+		bool pmd_valid = false;
+		bool pmd_present = false;
+
+		/* Check the PMD state to determine fault type */
+		/* Prefer reading from vmf->pmd if available, as vmf->orig_pmd
+		 * might be stale after handle_userfault() returns (e.g., after
+		 * UFFDIO_WRITEPROTECT modifies the PMD).
+		 */
+		if (vmf->pmd) {
+			/* If PMD is available, read it using lockless read */
+			pmd = pmdp_get_lockless(vmf->pmd);
+			pmd_valid = true;
+			pmd_present = !pmd_none(pmd);
+		} else if (vmf->flags & FAULT_FLAG_ORIG_PTE_VALID) {
+			/* Use orig_pmd if available and valid */
+			pmd = vmf->orig_pmd;
+			pmd_valid = true;
+			pmd_present = !pmd_none(pmd);
 		}
+
+		/*
+		 * Check for write-protection fault first.
+		 * This happens when:
+		 * - It's a write fault
+		 * - WP is enabled on the VMA
+		 * - The PMD is present and has uffd-wp bit set
+		 *
+		 * Note: We need to read the current PMD to check for WP bit.
+		 * If we can't read the PMD (pmd_valid is false), we can't determine
+		 * if WP is set, so we proceed with normal fault handling. The kernel's
+		 * page fault handler will handle WP detection when it maps the PMD.
+		 */
+		if ((vmf->flags & FAULT_FLAG_WRITE) && userfaultfd_wp(vmf->vma)) {
+			bool wp_fault = false;
+
+			if (pmd_valid && pmd_present) {
+				wp_fault = userfaultfd_huge_pmd_wp(vmf->vma, pmd);
+				printk(KERN_ERR "pmd_fault WP check: pmd_valid=%d pmd_present=%d wp_fault=%d\n",
+					pmd_valid, pmd_present, wp_fault);
+			} else {
+				printk(KERN_ERR "pmd_fault WP check skipped: pmd_valid=%d pmd_present=%d (can't read PMD)\n",
+					pmd_valid, pmd_present);
+			}
+
+			if (wp_fault) {
+				printk(KERN_ERR "pmd_fault handling userfault wp fault\n");
+				return handle_userfault(vmf, VM_UFFD_WP);
+			}
+		}
+
+		/*
+		 * Check for missing fault.
+		 * This happens when:
+		 * - Missing fault handling is enabled on the VMA
+		 * - The PMD is not present (pmd_none)
+		 *
+		 * Note: Only check for missing fault if we can actually read
+		 * the PMD. If pmd_valid is false, it means we couldn't read
+		 * the PMD, but that doesn't mean the page is missing - proceed
+		 * with normal fault handling.
+		 */
 		if (userfaultfd_missing(vmf->vma)) {
-			// printk(KERN_ERR "pmd_fault handling userfault miss fault\n");
-			return handle_userfault(vmf, VM_UFFD_MISSING);
+			/* Only deliver missing fault if PMD is actually not present */
+			if (pmd_valid && !pmd_present) {
+				printk(KERN_ERR "pmd_fault handling userfault miss fault\n");
+				return handle_userfault(vmf, VM_UFFD_MISSING);
+			}
 		}
+
 	}
 
 	pgoff = linear_page_index(vmf->vma, pmd_addr);
